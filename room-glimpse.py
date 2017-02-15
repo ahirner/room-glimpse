@@ -23,12 +23,13 @@ import PIL.Image
 import picamera
 import picamera.array
 
+from queue import Queue
 from collections import namedtuple  #Forgo typing to maintain vinalla python 3.4 on RPi
+
 import json
 import io
-import socket
+import socket, requests
 import time, datetime
-from queue import Queue
 
 #Schema
 Snapshot = namedtuple('Snapshot','timestamp, img_rgb, motion_raw, motion_magnitude_raw')
@@ -117,6 +118,7 @@ def md_update(is_motion, snap: Snapshot):
 #Attention: runs synchronous to motion detection
 def md_rising(snap):
     a, m = snap.motion_raw, snap.motion_magnitude_raw
+    #calculate only for debugging purposes
     avg_x, avg_y = a['x'].sum() / MOTION_W, a['y'].sum() / MOTION_H
     avg_m = m.sum()
     print('Motion detected, avg_x: %i, avg_y: %i, mag: %i' % (avg_x, avg_y, avg_m) )
@@ -139,11 +141,8 @@ def md_falling(snap):
 
 
 
-import requests
-import operator
-
-
 def processRequest( json, data, headers, params ):
+    #From example code of project oxford 
     """
     Parameters:
     json: Used when processing images from its URL. See API Documentation
@@ -176,7 +175,6 @@ def processRequest( json, data, headers, params ):
         else:
             print( "Error code: %d" % ( response.status_code ) )
             print( "Message: %s" % ( response.json()['error']['message'] ) )
-
         break
         
     return result
