@@ -1,2 +1,4 @@
+__pycache__/
+**/*.ipynb
 runnb.sh
-./creds
+./creds/**
