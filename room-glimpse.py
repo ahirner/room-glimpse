@@ -12,6 +12,9 @@ MD_BLOCK_FRACTION = 0.008 #Fraction of blocks that must show movement
 MD_SPEED = 2.0            #How many screens those blocks must move per second
 MD_FALLOFF = 0.5          #How many seconds no motion must be present to trigger completion of a scene
 
+#Config Persistency
+DATA_FOLDER = './data'
+
 #Config Azure
 AZURE_COG_HOST = 'https://westus.api.cognitive.microsoft.com/vision/v1.0/analyze'
 AZURE_COG_RETRIES = 3
@@ -24,21 +27,47 @@ import picamera
 import picamera.array
 
 from queue import Queue
-from collections import namedtuple  #Forgo typing to maintain vinalla python 3.4 on RPi
+from collections import namedtuple  #Forgo typing to maintain vanilla python 3.4 compatibility on RPi
 
 import json
-import io
+import io, os
 import socket, requests
 import time, datetime
 
 #Schema
-Snapshot = namedtuple('Snapshot','timestamp, img_rgb, motion_raw, motion_magnitude_raw')
 Motion = namedtuple('Motion', 'timestamp, triggered, vectors_x, vectors_y, sad, magnitude')
+Snapshot = namedtuple('Snapshot','timestamp, img_rgb, motion')
+PictureEvent = namedtuple('PictureEvent', 'timestamp, type, on, data')
+SceneCapture = namedtuple('SceneCapture', 'pic_on, pic_off')
 
-#Normalized versions with summary stats that can be sent to the cloud
-#Todo: Identifiy MotionEvents with SnapshotEvents
-MotionEvent = namedtuple('MotionEvent', 'timestamp, triggered, blocks_x, blocks_y, vectors_x, vectors_y, avg_x, avg_y, mag, sad')
-SnapshotEvent = namedtuple('SnapshotEvent', 'timestamp_on, timestamp_off, caption, caption_conf, tags')
+
+
+def to_jpg(rgb):
+    f = io.BytesIO()
+    PIL.Image.fromarray(rgb).save(f, 'jpeg')
+    return f.getvalue()
+    
+def to_ISO(timestamp):
+    return datetime.datetime.fromtimestamp(timestamp).isoformat()
+
+def to_ID(timestamp, on):
+    return str(to_ISO(timestamp).replace(':', '_')) + ('_on' if on else '_off')
+
+def get_convert_jpg(pic: PictureEvent, modify=True):
+    jpg = pic.data
+    if pic.type == 'rgb':
+        jpg = to_jpg(pic.data)
+        if modify: 
+            pic.data = jpg
+            pic.type = 'jpg'
+    #Todo: Exception handling
+    return jpg
+
+def save_jpg(jpg, _id):
+    if DATA_FOLDER is not None:
+        with open(os.path.join(DATA_FOLDER, _id+'.jpg'), "wb") as f:   
+            f.write(jpg)
+        
 
 
 
@@ -53,8 +82,9 @@ print("MD if >%i out of %i blocks show >%i pixel movement in a %i wide frame" % 
 
 
 
-snapshot_queue = Queue(3)
-motion_queue = Queue(FPS * 10) #Queue a maxmimum of 10 seconds motion-data
+scene_queue = Queue(3)          #Queue three full scenes
+motion_queue = Queue(FPS * 10)  #Queue a maxmimum of 10 seconds motion-data
+picture_queue = Queue(4)        #Queue a maximum pair of two on and off snapshots
 
 #Shared state for image and video analyzers
 #Todo: Encapsulate state better by passing into constructor or multiple inheritance from both detectors 
@@ -65,9 +95,13 @@ current_state = {
     'last_md_time_false' : time.time(),
     'md': False,
     'rgb' : None,
-    'last_jpg_motion' : None,
-    'last_jpg_still' : None
+    'last_pic_on' : None
 }
+
+class MyRGBAnalysis(picamera.array.PiRGBAnalysis):
+    def analyse(self, a): 
+        current_state['rgb'] = a 
+
 
 class MyMotionDetector(picamera.array.PiMotionAnalysis):
     def analyse(self, a):
@@ -75,69 +109,69 @@ class MyMotionDetector(picamera.array.PiMotionAnalysis):
             np.square(a['x'].astype(np.float)) +
             np.square(a['y'].astype(np.float))
             ).clip(0, 255).astype(np.uint8)
-        # If there're more than 10 vectors with a magnitude greater
-        # than 60, then say we've detected motion
+
         current_state['motion_vectors_raw'] = a
         current_state['motion_magnitude_raw'] = m
-        
-        #Todo: does motion- or RGB analysis come first? In the former case current_state['rgb'] lags one frame
-        snap = Snapshot(time.time(), current_state['rgb'], a, m)
-        
-        if (m > MD_MAGNITUDE).sum() > MD_BLOCKS:
-            md_update(True, snap)    
-        else: md_update(False, snap)
-        
-class MyRGBAnalysis(picamera.array.PiRGBAnalysis):
-    def analyse(self, a): 
-        current_state['rgb'] = a 
 
-def md_update(is_motion, snap: Snapshot):
+        
+        # If there're more than MD_BLOCKS vectors with a magnitude greater
+        # than MD_MAGNITUDE, then say we've detected motion
+        #Todo: does motion- or RGB analysis come first? In the former case current_state['rgb'] lags one frame
+        md = ((m > MD_MAGNITUDE).sum() > MD_BLOCKS)
+        
+        now = time.time()
+        motion = Motion(now, md, a['x'], a['y'], a['sad'], m)            
+        snap = Snapshot(now, current_state['rgb'], motion)
+        
+        md_update(snap)
+        
+def md_update(snap: Snapshot):
     now = snap.timestamp
     before = current_state['last_md_time_true']
+    is_motion = snap.motion.triggered
+    
     md = current_state['md']
     
-    #Queue motion_data
-    if md:
-        mv = snap.motion_raw
-        mm = snap.motion_magnitude_raw
-        motion_queue.put(Motion(now, is_motion, mv['x'], mv['y'], mv['sad'], mm))
-
-    #Test if 
+    #Test if motion detection flipped over
     if is_motion:
         current_state['last_md_time_true'] = now
         if not md:
             md_rising(snap)
             current_state['md'] = True
-            return
     else:
         current_state['last_md_time_false'] = now
         if md is True and before is not None and (now - before) > MD_FALLOFF:
             md_falling(snap)
-            current_state['md'] = False
+            current_state['md'] = False 
+    
+    #Queue motion data
+    if current_state['md']:
+        motion_queue.put(snap.motion)
+        
             
 #Attention: runs synchronous to motion detection
-def md_rising(snap):
-    a, m = snap.motion_raw, snap.motion_magnitude_raw
-    #calculate only for debugging purposes
-    avg_x, avg_y = a['x'].sum() / MOTION_W, a['y'].sum() / MOTION_H
-    avg_m = m.sum()
+def md_rising(snap: Snapshot):
+    now = snap.timestamp    
+    motion = snap.motion
+    
+    #Calculate Summary statistics only for debugging purposes
+    avg_x = motion.vectors_x.sum() / RESOLUTION[0]
+    avg_y = motion.vectors_y.sum() / RESOLUTION[1]
+    avg_m = motion.magnitude.sum() / (RESOLUTION[0] * RESOLUTION[1])
+    
     print('Motion detected, avg_x: %i, avg_y: %i, mag: %i' % (avg_x, avg_y, avg_m) )
-
+    
+    pic = PictureEvent(now, 'rgb', True, snap.img_rgb)
+    current_state['last_pic_on'] = pic
+    picture_queue.put(pic)
+    
 def md_falling(snap):
     now = snap.timestamp
     print("Motion vanished after %f secs" % (now - current_state['last_md_time_true']))
-
-    jpg = to_jpg(snap.img_rgb)
-    result = analyze_pic(jpg)
     
-    caption = result['description']['captions'][0]['text']
-    caption_confidence = result['description']['captions'][0]['confidence']
-    tags = result['description']['tags']
-    on = to_ISO(current_state['last_md_time_true'])
-    off = to_ISO(now)
-    
-    event = SnapshotEvent(on, off, caption, caption_confidence, tags)
-    snapshot_queue.put(event)
+    pic = PictureEvent(now, 'jpg', False, to_jpg(snap.img_rgb))
+    picture_queue.put(pic)
+    scene_queue.put(SceneCapture(current_state['last_pic_on'], pic))
 
 
 
@@ -180,25 +214,13 @@ def processRequest( json, data, headers, params ):
     return result
 
 def analyze_pic(jpg, features='Color,Categories,Tags,Description'):
-    # Computer Vision parameters
     params = { 'visualFeatures' : features} 
-
     headers = dict()
     headers['Ocp-Apim-Subscription-Key'] = AZURE_COG_KEY
     headers['Content-Type'] = 'application/octet-stream'
-
     result = processRequest(None, jpg, headers, params )
     return result
 
-
-
-def to_jpg(rgb):
-    f = io.BytesIO()
-    PIL.Image.fromarray(rgb).save(f, 'jpeg')
-    return f.getvalue()
-    
-def to_ISO(timestamp):
-    return datetime.datetime.fromtimestamp(timestamp).isoformat()    
 
 
 #Custom encoder for objects containing numpy 
@@ -213,34 +235,73 @@ class MsgEncoder(json.JSONEncoder):
         else:
             return super(MsgEncoder, self).default(obj)
 
-def dispatch_msgs(azure_msg):
+#Normalized versions with summary stats that can be sent to the cloud
+MotionEvent = namedtuple('MotionEvent', 'timestamp, triggered, blocks_x, blocks_y, vectors_x, vectors_y, avg_x, avg_y, mag, sad')
+SceneEvent = namedtuple('SceneEvent', 'timestamp_on, timestamp_off, caption, caption_conf, tags')        
 
+
+last_description = ''
+def dispatch_scene(azure_msg):
+    while True:
+        scene = scene_queue.get()
+        
+        jpg_off = get_convert_jpg(scene.pic_off, False)
+        
+        result = analyze_pic(jpg_off)
+        caption = result['description']['captions'][0]['text']
+        caption_confidence = result['description']['captions'][0]['confidence']
+        tags = result['description']['tags']
+        on = to_ISO(scene.pic_on.timestamp)
+        off = to_ISO(scene.pic_off.timestamp)
+
+        event = SceneEvent(on, off, caption, caption_confidence, tags)
+        print(event)
+        azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(event._asdict(), cls=MsgEncoder))
+        
+        scene_queue.task_done()
+                
+def dispatch_motiondata(azure_msg):
     #SnapshotEvents
     #SetOption Batching to False to come closer to realtime HTTP calls.
     #Caveat: If MotionEvent queue is not emptied yet, it will block this messages. Todo: run in separate thread.
     #Discussion here: https://github.com/Azure/azure-iot-sdk-python/issues/15
     
-    while snapshot_queue.empty() == False:
-        se = snapshot_queue.get()
-        print(se)
-        azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(se._asdict()))
-    
     #MotionEvents
     #SetOption Batching to True to save HTTP calls    
-    nr_motion = 0
-    while motion_queue.empty() == False:
+    while True:
         m = motion_queue.get()
 
         #MotionEvent = namedtuple('MotionEvent', 'timestamp, triggered, blocks_x, blocks_y, vectors_x, vectors_y, avg_x, avg_y, min_x, min_y, mag')
-        #Todo: Normalize Fully
-        avg_x, avg_y = m.vectors_x.sum() / MOTION_W, m.vectors_y.sum() / MOTION_H
-        avg_m = m.magnitude.sum()
-        me = MotionEvent(m.timestamp, m.triggered, MOTION_W, MOTION_H, list(m.vectors_x.flatten()), list(m.vectors_y.flatten()),                          avg_x, avg_y, avg_m, list(m.sad.flatten()))
+        avg_x = m.vectors_x.sum() / RESOLUTION[0]
+        avg_y = m.vectors_y.sum() / RESOLUTION[1]
+        avg_m = m.magnitude.sum() / (RESOLUTION[0] * RESOLUTION[1])
+        
+        me = MotionEvent(to_ISO(m.timestamp), to_ISO(m.triggered), MOTION_W, MOTION_H, list(m.vectors_x.flatten()), list(m.vectors_y.flatten()),                          avg_x, avg_y, avg_m, list(m.sad.flatten()))
 
-        print(nr_motion)
-        azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(me._asdict(), cls=MsgEncoder))
-        nr_motion += 1
+        #print(nr_motion)
+        #azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(me._asdict(), cls=MsgEncoder))
+        motion_queue.task_done()
+        
+last_time_on = None
+last_time_off = None
+id_on = None
+id_off = None
 
+def publish_pictures():
+    while True:
+        p = picture_queue.get()
+
+        jpg = get_convert_jpg(p, False)
+        _id = to_ID(p.timestamp, p.on)
+        save_jpg(jpg, _id)
+        
+        picture_queue.task_done()  
+
+
+
+import _thread
+
+azure_msg = D2CMsgSender(AZURE_DEV_CONNECTION_STRING)
 
 
 with picamera.PiCamera() as camera:      
@@ -248,13 +309,13 @@ with picamera.PiCamera() as camera:
     camera.framerate = FPS
     camera.rotation = ROTATION
     
-    #Motion and video
+    #Set up motion and video stream analyzer
     camera.start_recording(
         '/dev/null',
         format='h264',
         motion_output=MyMotionDetector(camera)
         )
-    #RGB
+    #Set up RGB capture in parallel
     camera.start_recording(
         MyRGBAnalysis(camera),
         format='rgb',
@@ -262,17 +323,23 @@ with picamera.PiCamera() as camera:
     )
     camera.wait_recording(0.5)
 
-    azure_msg = D2CMsgSender(AZURE_DEV_CONNECTION_STRING)    
+    
+    _thread.start_new_thread(dispatch_scene, (azure_msg,))
+    _thread.start_new_thread(dispatch_motiondata, (azure_msg,))
+    _thread.start_new_thread(publish_pictures, ())
+
     while True:       
         try:
-            dispatch_msgs(azure_msg)
-            time.sleep(0.1)
-                
+            time.sleep(1)       
         except KeyboardInterrupt:
             break
-            
+
     camera.stop_recording(splitter_port=2)
     camera.stop_recording()
+    
+    scene_queue.join()
+    motion_queue.join()
+    picture_queue.join()
 
 
 
