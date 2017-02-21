@@ -65,102 +65,97 @@ MOTION_H = RESOLUTION[1] // BLOCKSIZE + 1
 BLOCKS = (MOTION_W)*(MOTION_H)
 MD_BLOCKS = int(MD_BLOCK_FRACTION * BLOCKS)
 MD_MAGNITUDE = int(MD_SPEED / FPS * RESOLUTION[0])
-print("MD if >%i out of %i blocks show >%i pixel movement in a %i wide frame" % (MD_BLOCKS, BLOCKS, MD_MAGNITUDE, RESOLUTION[0]))
+print("Motion detected if >%i out of %i blocks show >%i pixel movement in a %i wide frame" % (MD_BLOCKS, BLOCKS, MD_MAGNITUDE, RESOLUTION[0]))
 
 
-
-#Todo: put into main
-scene_queue = Queue(3)          #Queue three full scenes
-motion_queue = Queue(FPS * 10)  #Queue a maxmimum of 10 seconds motion-data
-picture_queue = Queue(4)        #Queue a maximum pair of two on and off snapshots
-
-#Shared state for image and video analyzers
-#Todo: Encapsulate shared state better by passing into constructor or multiple inheritance 
-current_state = {
-    'motion_vectors_raw' : None,
-    'motion_magnitude_raw': None,
-    'last_md_time_true' : None,
-    'last_md_time_false' : time.time(),
-    'md': False,
-    'rgb' : None,
-    'last_pic_on' : None
-}
 
 class MyRGBAnalysis(picamera.array.PiRGBAnalysis):
+    def __init__(self, camera):
+        super().__init__(camera)
+        self.rgb = None
+        
     def analyse(self, a): 
-        current_state['rgb'] = a 
-
+        self.rgb = a 
 
 class MyMotionDetector(picamera.array.PiMotionAnalysis):
+    
+    def __init__(self, camera, rgb_detect: MyRGBAnalysis, scene_queue, motion_queue, picture_queue):
+        super().__init__(camera)
+        
+        self.last_md_time_false = time.time()
+        self.last_md_time_true = None
+        self.rgb_detect = rgb_detect
+        self.md = False
+        
+        self.scene_queue = scene_queue
+        self.motion_queue = motion_queue
+        self.picture_queue = picture_queue
+        
     def analyse(self, a):
         m = np.sqrt(
             np.square(a['x'].astype(np.float)) +
             np.square(a['y'].astype(np.float))
             ).clip(0, 255).astype(np.uint8)
-
-        current_state['motion_vectors_raw'] = a
-        current_state['motion_magnitude_raw'] = m
-
-        
+    
         #If there're more than MD_BLOCKS vectors with a magnitude greater
         #than MD_MAGNITUDE, then say we've detected motion
-        #Todo: does motion or RGB analysis come first? In the former case, current_state['rgb'] lags one frame
-        # --> use separate picamera capture
         md = ((m > MD_MAGNITUDE).sum() > MD_BLOCKS)
         
         now = time.time()
-        motion = Motion(now, md, a['x'], a['y'], a['sad'], m)            
-        snap = Snapshot(now, current_state['rgb'], motion)
+        motion = Motion(now, md, a['x'], a['y'], a['sad'], m)
         
-        md_update(snap)
+        #Todo: does motion or RGB analysis come first? In the former case, current_state['rgb'] lags one frame
+        # --> use separate picamera capture        
+        snap = Snapshot(now, rgb_detect.rgb, motion)
         
-def md_update(snap: Snapshot):
-    now = snap.timestamp
-    before = current_state['last_md_time_true']
-    is_motion = snap.motion.triggered
-    
-    md = current_state['md']
-    
-    #Test if motion detection flipped over
-    if is_motion:
-        current_state['last_md_time_true'] = now
-        if not md:
-            md_rising(snap)
-            current_state['md'] = True
-    else:
-        current_state['last_md_time_false'] = now
-        if md is True and before is not None and (now - before) > MD_FALLOFF:
-            md_falling(snap)
-            current_state['md'] = False 
-    
-    #Queue motion data
-    if current_state['md']:
-        motion_queue.put(snap.motion)
+        self.md_update(snap)
         
-            
-#Attention: runs synchronous to motion detection
-def md_rising(snap: Snapshot):
-    now = snap.timestamp    
-    motion = snap.motion
-    
-    #Calculate Summary statistics only for debugging purposes
-    avg_x = motion.vectors_x.sum() / RESOLUTION[0]
-    avg_y = motion.vectors_y.sum() / RESOLUTION[1]
-    avg_m = motion.magnitude.sum() / (RESOLUTION[0] * RESOLUTION[1])
-    
-    print('Motion detected, avg_x: %i, avg_y: %i, mag: %i' % (avg_x, avg_y, avg_m) )
-    
-    pic = PictureEvent(now, 'rgb', True, snap.img_rgb)
-    current_state['last_pic_on'] = pic
-    picture_queue.put(pic)
-    
-def md_falling(snap: Snapshot):
-    now = snap.timestamp
-    print("Motion vanished after %f secs" % (now - current_state['last_md_time_true']))
-    
-    pic = PictureEvent(now, 'jpg', False, to_jpg(snap.img_rgb))
-    picture_queue.put(pic)
-    scene_queue.put(SceneCapture(current_state['last_pic_on'], pic))
+    def md_update(self, snap: Snapshot):
+        now = snap.timestamp
+        before = self.last_md_time_true
+        is_motion = snap.motion.triggered
+
+        #Test if motion detection flipped over
+        if is_motion:
+            self.last_md_time_true = now
+            if not self.md:
+                self.md_rising(snap)
+                self.md = True
+        else:
+            self.last_md_time_false = now
+            if self.md is True and before is not None and (now - before) > MD_FALLOFF:
+                self.md_falling(snap)
+                self.md = False 
+
+        #Queue motion data
+        if self.md:
+            if (self.motion_queue): self.motion_queue.put(snap.motion)
+
+
+    #Attention: runs in blocking sync with motion detection
+    def md_rising(self, snap: Snapshot):
+        now = snap.timestamp    
+        motion = snap.motion
+
+        #Calculate Summary statistics only for debugging purposes
+        avg_x = motion.vectors_x.sum() / RESOLUTION[0]
+        avg_y = motion.vectors_y.sum() / RESOLUTION[1]
+        avg_m = motion.magnitude.sum() / (RESOLUTION[0] * RESOLUTION[1])
+
+        print('Motion detected, avg_x: %i, avg_y: %i, mag: %i' % (avg_x, avg_y, avg_m) )
+
+        pic = PictureEvent(now, 'rgb', True, snap.img_rgb)
+        self.last_pic_on = pic
+        if (self.picture_queue): self.picture_queue.put(pic)
+
+    def md_falling(self, snap: Snapshot):
+        now = snap.timestamp
+        print("Motion vanished after %f secs" % (now - self.last_md_time_true))
+
+        pic = PictureEvent(now, 'jpg', False, to_jpg(snap.img_rgb))
+        
+        if (self.picture_queue): self.picture_queue.put(pic)
+        if (self.scene_queue): self.scene_queue.put(SceneCapture(self.last_pic_on, pic))
 
 
 
@@ -239,22 +234,31 @@ def publish_pictures(picture_queue):
 import _thread
 
 if __name__ == "__main__":
+
+    #Create queues
+    #Todo: make cloud telemetrics and saving pictures optional    
+    scene_queue = Queue(3)          #Queue three full scenes
+    motion_queue = Queue(FPS * 10)  #Queue a maxmimum of 10 seconds motion-data
+    picture_queue = Queue(4)        #Queue a maximum pair of two on and off snapshots
     
     with picamera.PiCamera() as camera:
         camera.resolution = RESOLUTION
         camera.framerate = FPS
         camera.rotation = ROTATION
+        
+        rgb_detect = MyRGBAnalysis(camera)
+        motion_detect = MyMotionDetector(camera, rgb_detect, scene_queue, motion_queue, picture_queue)
 
         print("Starting camera and motion detection...")    
         #Set up motion and video stream analyzer
         camera.start_recording(
             '/dev/null',
             format='h264',
-            motion_output=MyMotionDetector(camera)
+            motion_output=motion_detect
             )
-        #Set up RGB capture in parallel
+        #Set up RGB capture on a splitter port
         camera.start_recording(
-            MyRGBAnalysis(camera),
+            rgb_detect,
             format='rgb',
             splitter_port=2
         )
@@ -277,13 +281,9 @@ if __name__ == "__main__":
         camera.stop_recording(splitter_port=2)
         camera.stop_recording()
 
-        print("Camera stopped, waiting for qeued data to dispatch")
+        print("Camera stopped, waiting for queued data to dispatch")
 
         scene_queue.join()
         motion_queue.join()
         picture_queue.join()
-
-
-
-
 
