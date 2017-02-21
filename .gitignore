@@ -1,6 +1,6 @@
 __pycache__/
 **/*.ipynb
 runnb.sh
-./creds/**
-./data/**
+creds/**
+data/**
 iothub_client.so
