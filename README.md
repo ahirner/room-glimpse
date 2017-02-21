@@ -12,7 +12,7 @@ I wanted to try Azure's IoT Hub for data ingestion. The results that describe a 
 
 The motion triggers the first snapshot wichi is saved onto the RPi. At the same time, motion vector data from each video frame is forwarded to the cloud asynchronously. 
 
-**I pause to complete the scene**
+**I pause to complete the scene**   
 ![alt-text](https://raw.githubusercontent.com/ahirner/room-glimpse/master/example_snapshots/2017-02-21T10_52_22.553099_off.jpg)
 
 ```javascript
