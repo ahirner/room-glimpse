@@ -37,7 +37,7 @@ This time the description is pretty accurate (and confident).
 
 #Installation
 - [Setup](https://azure.microsoft.com/en-us/resources/samples/iot-hub-c-raspberrypi-getstartedkit/) an Azure IoT Hub and add the RPi as a device.
-- git clone https://github.com/ahirner/room-glimpse.git
+- `git clone https://github.com/ahirner/room-glimpse.git`
 - Create `credentials.py` in `./creds` with the Azure Cognitive API key, the IoT device ID and a device connection string.
 ```python
 AZURE_COG_KEY= 'xxx'
@@ -48,7 +48,7 @@ AZURE_DEV_CONNECTION_STRING='HostName=zzz.azure-devices.net;SharedAccessKeyName=
 - Start with `python3 room-glimpse.py`
 
 Only the HTTP API is used to to simplify installation. Instead, the dedicated [azure-iot-python SDK](https://github.com/azure/azure-iot-sdk-python) can batch and/or use MQTT for less overhead (but is not available via pip3 yet).
-Parameters to configure video stream and motion thresholds are at the top of the file (_proper configuration tbd_).
+Configuration for the video stream, motion thresholds and cloud endpoints are in `config.py`.
 
 #More ideas
 1) Of course, nothing prevents you from running/training your own version of a [talking NN](https://github.com/tensorflow/models/tree/master/im2txt). In fact, this project is a vantage point to try pushing computing on the edge. Sam maintains a [pip wheel to install TensorFlow](https://github.com/samjabrahams/tensorflow-on-raspberry-pi) on the little RPi. [Pete Warden](https://petewarden.com/2016/12/30/rewriting-tensorflow-graphs-with-the-gtt/) has done amazing work recently to trim down NNs in a principled way (e.g. quantization for fixed point math).
