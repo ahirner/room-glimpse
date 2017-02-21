@@ -4,22 +4,15 @@
 
 from __future__ import division
 
-#Config Camera
-RESOLUTION = (640, 480)
-FPS = 30
-ROTATION = 180
-MD_BLOCK_FRACTION = 0.008 #Fraction of blocks that must show movement
-MD_SPEED = 2.0            #How many screens those blocks must move per second
-MD_FALLOFF = 0.75         #How many seconds no motion must be present to trigger completion of a scene
-
-#Config Persistency
-DATA_FOLDER = './data'
-
-#Config Azure
-AZURE_COG_HOST = 'https://westus.api.cognitive.microsoft.com/vision/v1.0/analyze'
-AZURE_COG_RETRIES = 3
+from config import *
 from creds.credentials import *
+from vision import *
+
 from device.D2CMsgSender import D2CMsgSender
+import json
+import io, os
+import socket
+import time, datetime
 
 import numpy as np
 import PIL.Image
@@ -28,11 +21,6 @@ import picamera.array
 
 from queue import Queue
 from collections import namedtuple  #Forgo typing to maintain vanilla python 3.4 compatibility on RPi
-
-import json
-import io, os
-import socket, requests
-import time, datetime
 
 #Schema
 Motion = namedtuple('Motion', 'timestamp, triggered, vectors_x, vectors_y, sad, magnitude')
@@ -66,8 +54,7 @@ def get_convert_jpg(pic: PictureEvent, modify=True):
 def save_jpg(jpg, _id):
     if DATA_FOLDER is not None:
         with open(os.path.join(DATA_FOLDER, _id+'.jpg'), "wb") as f:   
-            f.write(jpg)
-        
+            f.write(jpg)     
 
 
 
@@ -177,54 +164,6 @@ def md_falling(snap: Snapshot):
 
 
 
-def processRequest(json, data, headers, params ):
-    #From example code of project Oxford 
-    """
-    Parameters:
-    json: Used when processing images from its URL. See API Documentation
-    data: Used when processing image read from disk. See API Documentation
-    headers: Used to pass the key information and the data type request
-    """
-    retries = 0
-    result = None
-
-    while True:
-        response = requests.request( 'post', AZURE_COG_HOST, json = json, data = data, headers = headers, params = params )
-        if response.status_code == 429: 
-            print( "Message: %s" % ( response.json()['error']['message'] ) )
-            if retries <= AZURE_COG_RETRIES: 
-                time.sleep(1) 
-                retries += 1
-                continue
-            else: 
-                print( 'Error: failed after retrying!' )
-                break
-
-        elif response.status_code == 200 or response.status_code == 201:
-            if 'content-length' in response.headers and int(response.headers['content-length']) == 0: 
-                result = None 
-            elif 'content-type' in response.headers and isinstance(response.headers['content-type'], str): 
-                if 'application/json' in response.headers['content-type'].lower(): 
-                    result = response.json() if response.content else None 
-                elif 'image' in response.headers['content-type'].lower(): 
-                    result = response.content
-        else:
-            print( "Error code: %d" % ( response.status_code ) )
-            print( "Message: %s" % ( response.json()['error']['message'] ) )
-        break
-        
-    return result
-
-def analyze_pic(jpg, features='Color,Categories,Tags,Description'):
-    params = { 'visualFeatures' : features} 
-    headers = dict()
-    headers['Ocp-Apim-Subscription-Key'] = AZURE_COG_KEY
-    headers['Content-Type'] = 'application/octet-stream'
-    result = processRequest(None, jpg, headers, params )
-    return result
-
-
-
 #Custom encoder for objects containing numpy 
 class MsgEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -247,7 +186,7 @@ def dispatch_scene(scene_queue, azure_msg):
         
         jpg_off = get_convert_jpg(scene.pic_off, False)
         
-        result = analyze_pic(jpg_off)
+        result = analyze_img(jpg_off)
         caption = result['description']['captions'][0]['text']
         caption_confidence = result['description']['captions'][0]['confidence']
         tags = result['description']['tags']

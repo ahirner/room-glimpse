@@ -18,7 +18,7 @@ import time
 import requests
 import urllib
 
-
+#Adapted to work with python3
 class D2CMsgSender:
     
     API_VERSION = '2016-02-03'
