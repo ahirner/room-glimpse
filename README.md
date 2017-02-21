@@ -26,7 +26,7 @@ This is how the second snapshot is described by Azure's cognitive API. Fair enou
 
 After no motion was detected for a set amount of time (0.75 secs in that case), another scene is analyzed.
 
-**Now it's just the the bare room**
+**Now it's just the the bare room**   
 ![alt-text](https://raw.githubusercontent.com/ahirner/room-glimpse/master/example_snapshots/2017-02-21T10_52_24.915270_off.jpg)
 ```javascript
     caption: 'a living room with hard wood floor'
