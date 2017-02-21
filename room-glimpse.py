@@ -10,7 +10,7 @@ FPS = 30
 ROTATION = 180
 MD_BLOCK_FRACTION = 0.008 #Fraction of blocks that must show movement
 MD_SPEED = 2.0            #How many screens those blocks must move per second
-MD_FALLOFF = 0.5          #How many seconds no motion must be present to trigger completion of a scene
+MD_FALLOFF = 0.75         #How many seconds no motion must be present to trigger completion of a scene
 
 #Config Persistency
 DATA_FOLDER = './data'
@@ -82,12 +82,13 @@ print("MD if >%i out of %i blocks show >%i pixel movement in a %i wide frame" % 
 
 
 
+#Todo: put into main
 scene_queue = Queue(3)          #Queue three full scenes
 motion_queue = Queue(FPS * 10)  #Queue a maxmimum of 10 seconds motion-data
 picture_queue = Queue(4)        #Queue a maximum pair of two on and off snapshots
 
 #Shared state for image and video analyzers
-#Todo: Encapsulate state better by passing into constructor or multiple inheritance from both detectors 
+#Todo: Encapsulate shared state better by passing into constructor or multiple inheritance 
 current_state = {
     'motion_vectors_raw' : None,
     'motion_magnitude_raw': None,
@@ -114,9 +115,10 @@ class MyMotionDetector(picamera.array.PiMotionAnalysis):
         current_state['motion_magnitude_raw'] = m
 
         
-        # If there're more than MD_BLOCKS vectors with a magnitude greater
-        # than MD_MAGNITUDE, then say we've detected motion
-        #Todo: does motion- or RGB analysis come first? In the former case current_state['rgb'] lags one frame
+        #If there're more than MD_BLOCKS vectors with a magnitude greater
+        #than MD_MAGNITUDE, then say we've detected motion
+        #Todo: does motion or RGB analysis come first? In the former case, current_state['rgb'] lags one frame
+        # --> use separate picamera capture
         md = ((m > MD_MAGNITUDE).sum() > MD_BLOCKS)
         
         now = time.time()
@@ -165,7 +167,7 @@ def md_rising(snap: Snapshot):
     current_state['last_pic_on'] = pic
     picture_queue.put(pic)
     
-def md_falling(snap):
+def md_falling(snap: Snapshot):
     now = snap.timestamp
     print("Motion vanished after %f secs" % (now - current_state['last_md_time_true']))
     
@@ -175,8 +177,8 @@ def md_falling(snap):
 
 
 
-def processRequest( json, data, headers, params ):
-    #From example code of project oxford 
+def processRequest(json, data, headers, params ):
+    #From example code of project Oxford 
     """
     Parameters:
     json: Used when processing images from its URL. See API Documentation
@@ -235,13 +237,11 @@ class MsgEncoder(json.JSONEncoder):
         else:
             return super(MsgEncoder, self).default(obj)
 
-#Normalized versions with summary stats that can be sent to the cloud
+#Normalized versions with summary stats to be sent to the cloud
 MotionEvent = namedtuple('MotionEvent', 'timestamp, triggered, blocks_x, blocks_y, vectors_x, vectors_y, avg_x, avg_y, mag, sad')
 SceneEvent = namedtuple('SceneEvent', 'timestamp_on, timestamp_off, caption, caption_conf, tags')        
 
-
-last_description = ''
-def dispatch_scene(azure_msg):
+def dispatch_scene(scene_queue, azure_msg):
     while True:
         scene = scene_queue.get()
         
@@ -260,14 +260,13 @@ def dispatch_scene(azure_msg):
         
         scene_queue.task_done()
                 
-def dispatch_motiondata(azure_msg):
-    #SnapshotEvents
-    #SetOption Batching to False to come closer to realtime HTTP calls.
-    #Caveat: If MotionEvent queue is not emptied yet, it will block this messages. Todo: run in separate thread.
-    #Discussion here: https://github.com/Azure/azure-iot-sdk-python/issues/15
+def dispatch_motiondata(motion_queue, azure_msg):
     
-    #MotionEvents
-    #SetOption Batching to True to save HTTP calls    
+    #Todo: we could reduce overhead by enabling batch transfer (with caveats interleaving low- and high latency messages).
+    #This is only feasible with the official Python SDK. On *nix you still need to manually compile it.
+    #Therefore, we go with HTTP and REST for now.
+    #Discussion here: https://github.com/Azure/azure-iot-sdk-python/issues/15
+    nr_motion = 0
     while True:
         m = motion_queue.get()
 
@@ -278,16 +277,14 @@ def dispatch_motiondata(azure_msg):
         
         me = MotionEvent(to_ISO(m.timestamp), to_ISO(m.triggered), MOTION_W, MOTION_H, list(m.vectors_x.flatten()), list(m.vectors_y.flatten()),                          avg_x, avg_y, avg_m, list(m.sad.flatten()))
 
-        #print(nr_motion)
-        #azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(me._asdict(), cls=MsgEncoder))
-        motion_queue.task_done()
+        azure_msg.sendD2CMsg(AZURE_DEV_ID, json.dumps(me._asdict(), cls=MsgEncoder))
         
-last_time_on = None
-last_time_off = None
-id_on = None
-id_off = None
+        nr_motion += 1
+        print(nr_motion, to_ISO(m.timestamp), to_ISO(time.time()), avg_m)
+        
+        motion_queue.task_done()
 
-def publish_pictures():
+def publish_pictures(picture_queue):
     while True:
         p = picture_queue.get()
 
@@ -295,51 +292,57 @@ def publish_pictures():
         _id = to_ID(p.timestamp, p.on)
         save_jpg(jpg, _id)
         
+        print("File saved: " +_id)
         picture_queue.task_done()  
 
 
 
 import _thread
 
-azure_msg = D2CMsgSender(AZURE_DEV_CONNECTION_STRING)
-
-
-with picamera.PiCamera() as camera:      
-    camera.resolution = RESOLUTION
-    camera.framerate = FPS
-    camera.rotation = ROTATION
+if __name__ == "__main__":
     
-    #Set up motion and video stream analyzer
-    camera.start_recording(
-        '/dev/null',
-        format='h264',
-        motion_output=MyMotionDetector(camera)
+    with picamera.PiCamera() as camera:
+        camera.resolution = RESOLUTION
+        camera.framerate = FPS
+        camera.rotation = ROTATION
+
+        print("Starting camera and motion detection...")    
+        #Set up motion and video stream analyzer
+        camera.start_recording(
+            '/dev/null',
+            format='h264',
+            motion_output=MyMotionDetector(camera)
+            )
+        #Set up RGB capture in parallel
+        camera.start_recording(
+            MyRGBAnalysis(camera),
+            format='rgb',
+            splitter_port=2
         )
-    #Set up RGB capture in parallel
-    camera.start_recording(
-        MyRGBAnalysis(camera),
-        format='rgb',
-        splitter_port=2
-    )
-    camera.wait_recording(0.5)
+        camera.wait_recording(0.5)
 
-    
-    _thread.start_new_thread(dispatch_scene, (azure_msg,))
-    _thread.start_new_thread(dispatch_motiondata, (azure_msg,))
-    _thread.start_new_thread(publish_pictures, ())
+        #Todo: make cloud telemetrics and saving pictures optional
+        print("Starting threads for data dispatch...")
+        azure_msg = D2CMsgSender(AZURE_DEV_CONNECTION_STRING)    
+        _thread.start_new_thread(dispatch_scene, (scene_queue, azure_msg))
+        _thread.start_new_thread(dispatch_motiondata, (motion_queue, azure_msg))
+        _thread.start_new_thread(publish_pictures, (picture_queue,))
 
-    while True:       
-        try:
-            time.sleep(1)       
-        except KeyboardInterrupt:
-            break
+        print("--- Exit with Ctrl-C ---")
+        while True:       
+            try:
+                time.sleep(1)       
+            except KeyboardInterrupt:
+                break
 
-    camera.stop_recording(splitter_port=2)
-    camera.stop_recording()
-    
-    scene_queue.join()
-    motion_queue.join()
-    picture_queue.join()
+        camera.stop_recording(splitter_port=2)
+        camera.stop_recording()
+
+        print("Camera stopped, waiting for qeued data to dispatch")
+
+        scene_queue.join()
+        motion_queue.join()
+        picture_queue.join()
 
 
 
